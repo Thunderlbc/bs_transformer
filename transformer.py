@@ -3,7 +3,9 @@ import torch.nn as nn
 import numpy as np
 import time
 import math
+import logging
 from matplotlib import pyplot
+logging.basicConfig(level=logging.INFO)
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -17,11 +19,9 @@ np.random.seed(0)
 #tgt = torch.rand((20, 32, 512)) # (T,N,E)
 #out = transformer_model(src, tgt)
 
-input_window = 100 # number of input steps
-output_window = 1 # number of prediction steps, in this model its fixed to one
-block_len = input_window + output_window # for one input-output pair
+input_window = 200 # number of input steps
+NUM_Bs = 1000
 batch_size = 10
-train_size = 0.8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class PositionalEncoding(nn.Module):
@@ -51,13 +51,18 @@ class TransAm(nn.Module):
     def __init__(self,feature_size=250,num_layers=1,dropout=0.1):
         super(TransAm, self).__init__()
         self.model_type = 'Transformer'
-        self.input_embedding  = nn.Linear(1,feature_size)
+        # 公共的结构
         self.src_mask = None
-
         self.pos_encoder = PositionalEncoding(feature_size)
         self.encoder_layer = nn.TransformerEncoderLayer(d_model=feature_size, nhead=10, dropout=dropout)
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
-        self.decoder = nn.Linear(feature_size,1)
+
+        self.decoder = nn.Linear(feature_size*input_window, NUM_Bs)
+
+        # BA分开的结构
+        self.emb_B = nn.Linear(1,feature_size)
+        self.emb_A = nn.Linear(1,feature_size)
+
         self.init_weights()
 
     def init_weights(self):
@@ -65,18 +70,30 @@ class TransAm(nn.Module):
         self.decoder.bias.data.zero_()
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self,src):
+    def forward(self,blist, alist):
         # src with shape (input_window, batch_len, 1)
         if self.src_mask is None or self.src_mask.size(0) != len(src):
             device = src.device
             mask = self._generate_square_subsequent_mask(len(src)).to(device)
             self.src_mask = mask
 
-        src = self.input_embedding(src) # linear transformation before positional embedding
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src,self.src_mask)#, self.src_mask)
-        output = self.decoder(output)
-        return output
+        aemb = self.pos_encoder(self.emb_A(alist))
+        print('aemb.shape', aemb.shape)
+        bemb = self.pos_encoder(self.emb_B(blist))
+        aout = self.transformer_encoder(aemb, self.src_mask)
+        bout = self.transformer_encoder(bemb, self.src_mask)
+        # seq_len, batch_size, feature_size
+        print('aout.shape', aout.shape)
+
+        # seq_len, batch_size, feature_size*2
+        allemb = torch.concat((aout,  bout), dim=2)
+        print('allemb.shape', allemb.shape)
+        allemb = torch.concat
+        # 这里我们使用一个全连接层来做预测
+        bout = self.decoder(allemb)
+        
+        
+        return bout
 
     def _generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -94,67 +111,66 @@ should be (m+k) :  block_len, so to ensure that each block is complete,
 the end element of the last block should be the end element of the entire sequence, 
 so the actual number of blocks is [N - block_len + 1] 
 '''
-def create_inout_sequences(input_data, input_window ,output_window):
-    inout_seq = []
-    L = len(input_data)
-    block_num =  L - block_len + 1
-    # total of [N - block_len + 1] blocks
-    # where block_len = input_window + output_window
+def get_data(user_ins, train_split=0.7, validate_split=0.2):
+    """
+    我们预期的输入输出是：
+        in: user_id \t Blist[,] ot Alist[,] \t rank \t next_a \t next_b \t next_t
+       out: 7:2:1
+            train_data: [  ([B0,...,B200], [A0,...,A200], B201)  ]
+            validate_data: [  ([B0,...,B200], [A0,...,A200], B201)  ]
+            test_data: [  ([B0,...,B200], [A0,...,A200], B201)  ]
+        其中，Bi是离散的整数，范围是1~1000; Ai是连续的浮点数，范围是0~2000.0
+    """
 
-    for i in range( block_num ):
-        train_seq = input_data[i : i + input_window]
-        train_label = input_data[i + output_window : i + input_window + output_window]
-        inout_seq.append((train_seq ,train_label))
+    # 我们使用user_id hash 来做训练集、验证集、测试集的划o
+    import cityhash
+    test_split=1-train_split-validate_split
+    logging.info("Loading data with train split: {} validate split: {} test split: {}".format(train_split, validate_split, test_split))
+    train_data = []
+    validate_data = []
+    test_data = []
+    with open(user_ins, 'r') as fin:
+        for line in fin:
+            line = line.strip().split("\t")
+            user_id,blist,alist,rank,next_b,next_a,next_t  = line
+            blist = blist.split(',')
+            alist = alist.split(',')
+            # 这里我们使用user_id的hash值来做训练集、验证集、测试集的划分
+            # 我们使用cityhash来做hash
+            hash_val = cityhash.CityHash64(user_id) % 100
+            if hash_val < train_split * 100:
+                train_data.append((blist,alist,next_b,next_t))
+            elif hash_val < (train_split + validate_split) * 100:
+                validate_data.append((blist,alist,next_b,next_t))
+            else:
+                test_data.append((blist,alist,next_b,next_t))
 
-    return torch.FloatTensor(np.array(inout_seq))
-
-def get_data():
-    # construct a littel toy dataset
-    time        = np.arange(0, 400, 0.1)    
-    amplitude   = np.sin(time) + np.sin(time * 0.05) + \
-                  np.sin(time * 0.12) * np.random.normal(-0.2, 0.2, len(time))
-
-    from sklearn.preprocessing import MinMaxScaler
-    
-    #loading weather data from a file
-    #from pandas import read_csv
-    #series = read_csv('daily-min-temperatures.csv', header=0, index_col=0, parse_dates=True, squeeze=True)
-    
-    # looks like normalizing input values curtial for the model
-    scaler = MinMaxScaler(feature_range=(-1, 1)) 
-    #amplitude = scaler.fit_transform(series.to_numpy().reshape(-1, 1)).reshape(-1)
-    amplitude = scaler.fit_transform(amplitude.reshape(-1, 1)).reshape(-1)
-
-    sampels = int(len(time) * train_size) # use a parameter to control training size
-    train_data = amplitude[:sampels]
-    test_data = amplitude[sampels:]
-
-    # convert our train data into a pytorch train tensor
-    #train_tensor = torch.FloatTensor(train_data).view(-1)
-
-    train_sequence = create_inout_sequences( train_data,input_window ,output_window)
-    '''
-    train_sequence = train_sequence[:-output_window] # todo: fix hack? -> din't think this through, looks like the last n sequences are to short, so I just remove them. Hackety Hack..
-    # looks like maybe solved
-    '''
-    #test_data = torch.FloatTensor(test_data).view(-1) 
-    test_data = create_inout_sequences(test_data,input_window,output_window)
-    '''
-    test_data = test_data[:-output_window] # todo: fix hack?
-    '''
-    # shape with (block , sql_len , 2 )
-    return train_sequence.to(device),test_data.to(device)
-
+            
+    train_tensor = [
+        (torch.LongTensor(np.array(blist)).to(device), torch.FloatTensor(np.array(alist)).to(device), torch.FloatTensor(next_b).to(device), torch.FloatTensor(next_t).to(device)) for blist,alist,next_b,next_t in train_data
+    ]
+    validate_tensor = [
+        (torch.LongTensor(np.array(blist)).to(device), torch.FloatTensor(np.array(alist)).to(device), torch.FloatTensor(next_b).to(device), torch.FloatTensor(next_t).to(device)) for blist,alist,next_b,next_t in validate_data
+    ]
+    test_tensor = [
+        (torch.LongTensor(np.array(blist)).to(device), torch.FloatTensor(np.array(alist)).to(device), torch.FloatTensor(next_b).to(device), torch.FloatTensor(next_t).to(device)) for blist,alist,next_b,next_t in test_data
+    ]
+    return train_tensor, validate_tensor, test_tensor
 
 def get_batch(input_data, i , batch_size):
 
     # batch_len = min(batch_size, len(input_data) - 1 - i) #  # Now len-1 is not necessary
     batch_len = min(batch_size, len(input_data) - i)
     data = input_data[ i:i + batch_len ]
-    input = torch.stack([item[0] for item in data]).view((input_window,batch_len,1))
+
+    # 格式是 blist,alist,nextb,nextt
     # ( seq_len, batch, 1 ) , 1 is feature size
-    target = torch.stack([item[1] for item in data]).view((input_window,batch_len,1))
-    return input, target
+    inblist = torch.stack([item[0] for item in data]).view((input_window,batch_len,1))
+    inalist = torch.stack([item[1] for item in data]).view((input_window,batch_len,1))
+    # (1, batch, 1)
+    target_b = torch.stack([item[2] for item in data]).view((1,batch_len,1))
+    target_t = torch.stack([item[3] for item in data]).view((1,batch_len,1))
+    return inblist,inalist,target_b,target_t
 
 def train(train_data):
     model.train() # Turn on the train mode \o/
@@ -163,9 +179,10 @@ def train(train_data):
 
     for batch, i in enumerate(range(0, len(train_data), batch_size)):  # Now len-1 is not necessary
         # data and target are the same shape with (input_window,batch_len,1)
-        data, targets = get_batch(train_data, i , batch_size)
+        #data, targets = get_batch(train_data, i , batch_size)
+        inblist, inalist, target_b, target_t = get_batch(train_data, i , batch_size)
         optimizer.zero_grad()
-        output = model(data)
+        output = model(inblist,inalist)
         loss = criterion(output, targets)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.7)
@@ -250,7 +267,7 @@ def evaluate(eval_model, data_source):
             total_loss += len(data[0]) * criterion(output, targets).cpu().item()
     return total_loss / len(data_source)
 
-train_data, val_data = get_data()
+train_data, val_data, test_data = get_data()
 model = TransAm().to(device)
 
 criterion = nn.MSELoss()

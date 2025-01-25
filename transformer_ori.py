@@ -132,7 +132,7 @@ def get_data():
     # convert our train data into a pytorch train tensor
     #train_tensor = torch.FloatTensor(train_data).view(-1)
 
-    train_sequence = create_inout_sequences( train_data,input_window ,output_window)
+    train_sequence = nreate_inout_sequences( train_data,input_window ,output_window)
     '''
     train_sequence = train_sequence[:-output_window] # todo: fix hack? -> din't think this through, looks like the last n sequences are to short, so I just remove them. Hackety Hack..
     # looks like maybe solved
